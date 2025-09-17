@@ -1,7 +1,7 @@
 # global-activity-score
 ## Introduction
 ### GAS method
-Global activity scores <sup>[1]</sup> are introduced as a more accurate approximation to Sobol' indices in certain cases. It is based on global active subspace (GAS) method<sup>[2]</sup>, which is a generalization of active subspace (AS) method by replacing the matrix C with more "global" information. Theoretical results and experiments show that GAS is better when the test function has uncertainties, or it's discontinuous, and is giving similar results for ordinary cases with AS method.
+Global activity scores <sup>[1]</sup> are introduced as a more accurate approximation to Sobol' indices in certain cases. It is based on a generalization of active subspace (AS) method by replacing the matrix C with more "global" information. 
 
 Consider a square-integrable real-valued function $f(\pmb z)$ with domain $\Omega\subset\pmb R^d$ and finite second-order partial derivatives. Suppose that $\Omega$ is equipped with a probability measure with a cumulative distribution function in the form $\pmb F(\pmb z)=F_1(z_1)\cdot \ldots \cdot F_d(z_d)$, where $F_i$ are marginal distribution functions. 
 
@@ -21,12 +21,7 @@ $$\pmb C=\pmb U\Lambda \pmb U^T,\Lambda=diag(\lambda_1,...,\lambda_d), \lambda_1
 And the global activity score for the $i$th parameter, $1\leq i \leq d$, is defined as:
 $$\gamma_i(m)=\sum_{j=1}^{m}{\lambda_ju_{ij}^2}.$$
 
-## Usage
-Please refer to https://github.com/RuilongYue/global-active-subspace for function GAS() in global_as.py. After getting u and s from GAS(), global activity scores are calculated by choosing proper $m$. Refer to the three examples in this repo for more details.
-
 
 ## References
 
-[1]. The Global Active Subspace Method. (https://arxiv.org/abs/2304.14142)
-
-[2]. The Global Activity scores. (link to be added)
+[1]. The Global Activity scores. (link to be added)
