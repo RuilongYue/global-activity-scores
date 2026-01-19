@@ -183,6 +183,7 @@ def calculate_sensitivity_matrix(
     
     # We need two sets of perturbations: positive (right) and negative (left)
     delta_right = points / (1 - points)      # Maps (0, 1) -> (0, inf)
+    delta_right = points      # for uniform, (0, 1) is enough
     delta_left = -delta_right
 
     # Combine deltas and corresponding weights for easier processing
@@ -252,6 +253,316 @@ def calculate_sensitivity_matrix(
     # We can use a trick with einsum or a simple loop. A loop is very clear.
     for i in range(dim):
         C[:, i, i] = mean_squared_ratios[:, i]
+        
+    return C.mean(axis=0)
+
+
+import numpy as np
+from numpy.polynomial.legendre import leggauss
+from typing import Callable
+def calculate_sensitivity_matrix_uniform(
+    f: Callable[[np.ndarray], np.ndarray],
+    X: np.ndarray,
+    n_points: int = 4,
+    min_delta: float = 1e-3  # Threshold: specific steps smaller than this are masked
+) -> np.ndarray:
+    """
+    Calculates sensitivity matrix C using Gauss-Legendre Split method.
+    
+    Refinement: Instead of discarding entire intervals, it masks individual 
+    quadrature nodes where the perturbation (delta) is too small.
+    This prevents the noise term (1/delta^2) from exploding while preserving
+    integral contributions from safe nodes.
+    """
+    sample_len, dim = X.shape
+    f_value_old = f(X)
+
+    # --- 1. Quadrature Setup ---
+    nodes_std, weights_std = leggauss(n_points)
+    base_weights = weights_std / 2.0 
+
+    # --- 2. Calculate Mappings (Standard Split) ---
+    X_expanded = X[:, :, np.newaxis] 
+    
+    # -- Left Interval [0, X] --
+    points_left = (X_expanded / 2.0) * (nodes_std + 1)
+    deltas_left = points_left - X_expanded
+    weights_left_scaled = base_weights * X_expanded 
+
+    # -- Right Interval [X, 1] --
+    points_right = ((1 - X_expanded) / 2.0) * nodes_std + ((1 + X_expanded) / 2.0)
+    deltas_right = points_right - X_expanded
+    weights_right_scaled = base_weights * (1 - X_expanded)
+
+    # Combine
+    all_deltas = np.concatenate([deltas_left, deltas_right], axis=2)
+    all_weights = np.concatenate([weights_left_scaled, weights_right_scaled], axis=2)
+
+    # --- 3. Apply Fine-Grained Masking ---
+    # This is the key change. We check the absolute size of every single delta.
+    # If delta is too small, the ratio noise will be huge. We mask THIS weight to 0.
+    
+    mask = np.abs(all_deltas) > min_delta
+    
+    # Apply mask to weights. 
+    # Invalid nodes now have weight 0.0, so they contribute nothing to the sum.
+    all_weights = all_weights * mask
+
+    # (Optional) Re-normalization could be done here if you wanted to maintain 
+    # exact probability mass, but for noise suppression, simply dropping the 
+    # exploding term is usually safer and sufficient.
+
+    # --- 4. Batched Evaluation ---
+    total_perturbations = sample_len * dim * (2 * n_points)
+    base_X = np.repeat(X, dim * (2 * n_points), axis=0)
+    perturbation_matrix = np.zeros_like(base_X)
+    
+    delta_values_flat = all_deltas.reshape(sample_len, -1).flatten()
+    row_indices = np.arange(total_perturbations)
+    col_indices = np.tile(np.repeat(np.arange(dim), 2 * n_points), sample_len)
+    
+    perturbation_matrix[row_indices, col_indices] = delta_values_flat
+    
+    eval_batch = base_X + perturbation_matrix
+    
+    f_values_perturbed = f(eval_batch).reshape(sample_len, dim, 2 * n_points)
+    
+    # --- 5. Slopes and Integration ---
+    y_diff = f_values_perturbed - f_value_old[:, np.newaxis, np.newaxis]
+    
+    # Safe Division:
+    # We only care about division where mask is True.
+    # However, to avoid RuntimeWarnings, we use the 'where' argument.
+    # We reuse 'mask' which tells us exactly where delta is safe.
+    ratios = np.zeros_like(y_diff)
+    np.divide(y_diff, all_deltas, out=ratios, where=mask)
+    
+    # Gradient Estimate E[g]
+    # Because all_weights is 0 where mask is False, the "bad" ratios are ignored.
+    gradient_estimate = np.sum(ratios * all_weights, axis=2)
+    
+    # Second Moment Estimate E[g^2]
+    gradient_squared_estimate = np.sum((ratios**2) * all_weights, axis=2)
+    
+    # --- 6. Construct Matrix C ---
+    C = gradient_estimate[:, :, np.newaxis] * gradient_estimate[:, np.newaxis, :]
+    
+    for i in range(dim):
+        C[:, i, i] = gradient_squared_estimate[:, i]
+        
+    return C.mean(axis=0)
+
+import numpy as np
+from numpy.polynomial.legendre import leggauss
+from typing import Callable
+
+def calculate_sensitivity_matrix_renormalized(
+    f: Callable[[np.ndarray], np.ndarray],
+    X: np.ndarray,
+    n_points: int = 5,
+    min_delta: float = 0.05
+) -> np.ndarray:
+    """
+    Calculates sensitivity matrix C using Gauss-Legendre Split method.
+    
+    Refinement: Point-wise Masking with Weight Re-normalization.
+    1. Masks specific nodes that are too close to X.
+    2. Scales up the weights of the REMAINING nodes in that interval so that
+       the sum of weights still equals the interval length.
+    """
+    sample_len, dim = X.shape
+    f_value_old = f(X)
+
+    # --- 1. Quadrature Setup ---
+    nodes_std, weights_std = leggauss(n_points)
+    base_weights = weights_std / 2.0 
+    X_expanded = X[:, :, np.newaxis] 
+
+    # --- 2. Calculate Mappings (Left and Right Separately) ---
+    # We keep them separate initially to normalize them independently.
+
+    # -- Left Interval [0, X] --
+    points_left = (X_expanded / 2.0) * (nodes_std + 1)
+    deltas_left = points_left - X_expanded
+    weights_left = base_weights * X_expanded 
+    # Target sum for Left weights is exactly the length: X
+    target_sum_left = X_expanded
+
+    # -- Right Interval [X, 1] --
+    points_right = ((1 - X_expanded) / 2.0) * nodes_std + ((1 + X_expanded) / 2.0)
+    deltas_right = points_right - X_expanded
+    weights_right = base_weights * (1 - X_expanded)
+    # Target sum for Right weights is exactly the length: 1 - X
+    target_sum_right = 1.0 - X_expanded
+
+    # --- 3. Masking & Re-normalization ---
+
+    def renormalize_weights(deltas, weights, target_sum):
+        # 1. Identify safe nodes
+        mask = np.abs(deltas) > min_delta
+        
+        # 2. Apply mask (unsafe nodes become 0.0)
+        safe_weights = weights * mask
+        
+        # 3. Calculate the actual sum of weights we have left
+        # Shape: (sample_len, dim, 1)
+        actual_sum = np.sum(safe_weights, axis=2, keepdims=True)
+        
+        # 4. Calculate Scaling Factor
+        # If actual_sum is 0 (all nodes masked), we can't scale. set factor to 0.
+        factor = np.zeros_like(actual_sum)
+        
+        # Safe division: target / actual
+        np.divide(target_sum, actual_sum, out=factor, where=actual_sum > 0)
+        
+        # 5. Scale the weights
+        # The remaining nodes now carry the burden of the masked nodes
+        return safe_weights * factor
+
+    # Apply to Left
+    weights_left_final = renormalize_weights(deltas_left, weights_left, target_sum_left)
+    
+    # Apply to Right
+    weights_right_final = renormalize_weights(deltas_right, weights_right, target_sum_right)
+
+    # --- 4. Combine & Evaluate ---
+    all_deltas = np.concatenate([deltas_left, deltas_right], axis=2)
+    all_weights = np.concatenate([weights_left_final, weights_right_final], axis=2)
+
+    total_perturbations = sample_len * dim * (2 * n_points)
+    base_X = np.repeat(X, dim * (2 * n_points), axis=0)
+    perturbation_matrix = np.zeros_like(base_X)
+    
+    delta_values_flat = all_deltas.reshape(sample_len, -1).flatten()
+    row_indices = np.arange(total_perturbations)
+    col_indices = np.tile(np.repeat(np.arange(dim), 2 * n_points), sample_len)
+    
+    perturbation_matrix[row_indices, col_indices] = delta_values_flat
+    
+    eval_batch = base_X + perturbation_matrix
+    f_values_perturbed = f(eval_batch).reshape(sample_len, dim, 2 * n_points)
+    
+    # --- 5. Gradient Estimation ---
+    y_diff = f_values_perturbed - f_value_old[:, np.newaxis, np.newaxis]
+    
+    # Safe Division (only where we have non-zero weights)
+    # If a weight was masked to 0, we don't care about the ratio.
+    valid_mask = all_weights > 0.0
+    ratios = np.zeros_like(y_diff)
+    np.divide(y_diff, all_deltas, out=ratios, where=valid_mask)
+    
+    # Gradient Estimate E[g]
+    gradient_estimate = np.sum(ratios * all_weights, axis=2)
+    
+    # Second Moment Estimate E[g^2]
+    gradient_squared_estimate = np.sum((ratios**2) * all_weights, axis=2)
+    
+    # --- 6. Construct Matrix C ---
+    C = gradient_estimate[:, :, np.newaxis] * gradient_estimate[:, np.newaxis, :]
+    
+    for i in range(dim):
+        C[:, i, i] = gradient_squared_estimate[:, i]
+        
+    return C.mean(axis=0)
+
+def calculate_sensitivity_matrix_side_mask(
+    f: Callable[[np.ndarray], np.ndarray],
+    X: np.ndarray,
+    n_points: int = 5,
+    min_delta: float = 0.05 
+) -> np.ndarray:
+    """
+    Calculates sensitivity matrix C using Gauss-Legendre Split method.
+    
+    Refinement: Side-Interval Masking.
+    - Checks if the Left Interval [0, X] is large enough. If not, weights_left = 0.
+    - Checks if the Right Interval [X, 1] is large enough. If not, weights_right = 0.
+    - Does NOT drop the sample. It just ignores the contribution from the unstable side.
+    """
+    sample_len, dim = X.shape
+    f_value_old = f(X)
+
+    # --- 1. Quadrature Setup & Safety Threshold ---
+    nodes_std, weights_std = leggauss(n_points)
+    base_weights = weights_std / 2.0 
+
+    # Calculate the minimum interval length required to satisfy min_delta
+    # The closest a node gets to the edge in standard [-1, 1] is max(nodes_std)
+    # The distance ratio is (1 - max_node) / 2
+    max_node = np.max(nodes_std)
+    scaling_factor = (1.0 - max_node) / 2.0
+    
+    # We need: Length * scaling_factor > min_delta
+    min_required_len = min_delta / scaling_factor
+    
+    # --- 2. Calculate Mappings ---
+    X_expanded = X[:, :, np.newaxis] 
+    
+    # -- Left Interval [0, X] --
+    points_left = (X_expanded / 2.0) * (nodes_std + 1)
+    deltas_left = points_left - X_expanded
+    weights_left = base_weights * X_expanded 
+
+    # -- Right Interval [X, 1] --
+    points_right = ((1 - X_expanded) / 2.0) * nodes_std + ((1 + X_expanded) / 2.0)
+    deltas_right = points_right - X_expanded
+    weights_right = base_weights * (1 - X_expanded)
+
+    # --- 3. Apply Side-Interval Masking ---
+    
+    # Lengths of intervals
+    len_left = X                     # shape (sample_len, dim)
+    len_right = 1.0 - X              # shape (sample_len, dim)
+
+    # Create Boolean Masks (True if safe, False if unsafe)
+    mask_left = len_left > min_required_len
+    mask_right = len_right > min_required_len
+
+    # Expand masks to apply to weights: (sample_len, dim, 1) to broadcast over n_points
+    weights_left = weights_left * mask_left[:, :, np.newaxis]
+    weights_right = weights_right * mask_right[:, :, np.newaxis]
+
+    # Combine
+    all_deltas = np.concatenate([deltas_left, deltas_right], axis=2)
+    all_weights = np.concatenate([weights_left, weights_right], axis=2)
+
+    # --- 4. Batched Evaluation ---
+    total_perturbations = sample_len * dim * (2 * n_points)
+    base_X = np.repeat(X, dim * (2 * n_points), axis=0)
+    perturbation_matrix = np.zeros_like(base_X)
+    
+    delta_values_flat = all_deltas.reshape(sample_len, -1).flatten()
+    row_indices = np.arange(total_perturbations)
+    col_indices = np.tile(np.repeat(np.arange(dim), 2 * n_points), sample_len)
+    
+    perturbation_matrix[row_indices, col_indices] = delta_values_flat
+    
+    eval_batch = base_X + perturbation_matrix
+    f_values_perturbed = f(eval_batch).reshape(sample_len, dim, 2 * n_points)
+    
+    # --- 5. Slopes and Integration ---
+    y_diff = f_values_perturbed - f_value_old[:, np.newaxis, np.newaxis]
+    
+    # Safe Division:
+    # We only care about division where weight > 0.
+    # If weight is 0 (masked), we don't care about the result (it will be summed as 0).
+    # But to avoid RuntimeWarning or NaN from dividing by tiny deltas in masked regions:
+    valid_division_mask = all_weights > 0.0
+    
+    ratios = np.zeros_like(y_diff)
+    np.divide(y_diff, all_deltas, out=ratios, where=valid_division_mask)
+    
+    # Gradient Estimate E[g]
+    gradient_estimate = np.sum(ratios * all_weights, axis=2)
+    
+    # Second Moment Estimate E[g^2]
+    gradient_squared_estimate = np.sum((ratios**2) * all_weights, axis=2)
+    
+    # --- 6. Construct Matrix C ---
+    C = gradient_estimate[:, :, np.newaxis] * gradient_estimate[:, np.newaxis, :]
+    
+    for i in range(dim):
+        C[:, i, i] = gradient_squared_estimate[:, i]
         
     return C.mean(axis=0)
 
